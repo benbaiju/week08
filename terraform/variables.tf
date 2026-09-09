@@ -47,7 +47,7 @@ variable "aks_dns_prefix" {
 variable "aks_node_count" {
     description = "Number of nodes in the default AKS node pool"
     type        = number
-    default     = 2
+    default     = 3
 
     validation {
         condition     = var.aks_node_count >= 1
