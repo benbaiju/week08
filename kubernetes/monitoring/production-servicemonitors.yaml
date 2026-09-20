@@ -1,0 +1,79 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: user-service
+  namespace: production
+  labels:
+    app: user-service
+spec:
+  selector:
+    matchLabels:
+      app: user-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: student-service
+  namespace: production
+  labels:
+    app: student-service
+spec:
+  selector:
+    matchLabels:
+      app: student-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: lecturer-service
+  namespace: production
+  labels:
+    app: lecturer-service
+spec:
+  selector:
+    matchLabels:
+      app: lecturer-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: course-service
+  namespace: production
+  labels:
+    app: course-service
+spec:
+  selector:
+    matchLabels:
+      app: course-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: enrollment-service
+  namespace: production
+  labels:
+    app: enrollment-service
+spec:
+  selector:
+    matchLabels:
+      app: enrollment-service
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

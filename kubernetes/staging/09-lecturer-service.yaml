@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: lecturer-service
-          image: benbaijuweek09acr.azurecr.io/koalatech-lecturer-service:cdbdc4452443077304f6b367e7ce562a63f291b0
+          image:placeholder
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
@@ -57,9 +57,12 @@ kind: Service
 metadata:
   name: lecturer-service
   namespace: staging
+  labels:
+    app: lecturer-service
 spec:
   selector:
     app: lecturer-service
   ports:
-    - port: 8000
+    - name: http
+      port: 8000
       targetPort: 8000

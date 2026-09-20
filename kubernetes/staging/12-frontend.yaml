@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: benbaijuweek09acr.azurecr.io/koalatech-frontend:cdbdc4452443077304f6b367e7ce562a63f291b0
+          image: placeholder
           imagePullPolicy: Always
           ports:
             - containerPort: 80

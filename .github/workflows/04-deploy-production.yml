@@ -43,6 +43,10 @@ jobs:
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
+      - name: Apply production ServiceMonitors
+        run: |
+          kubectl apply -f kubernetes/monitoring/production-servicemonitors.yaml
+
       - name: Create PostgreSQL secret
         run: |
           kubectl create secret generic postgres-secret \
