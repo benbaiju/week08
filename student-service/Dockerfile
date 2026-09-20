@@ -2,12 +2,12 @@ FROM python:3.14.7-alpine
 
 WORKDIR /app
 
-COPY requirements.txt .
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev postgresql-dev \
+    && apk add --no-cache libpq
 
-RUN pip install \
-    --no-cache-dir \
-    --root-user-action=ignore \
-    -r requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir --root-user-action=ignore -r requirements.txt \
+    && apk del .build-deps
 
 COPY . .
 
