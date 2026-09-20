@@ -12,6 +12,131 @@ on:
 
 jobs:
 
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      TFSTATE_RG: ${{ vars.TFSTATE_RG }}
+      TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+      TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+      TFSTATE_LOCATION: australiaeast
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Bootstrap Terraform state storage
+        run: |
+          set -euo pipefail
+
+          if ! az group show --name "${TFSTATE_RG}" >/dev/null 2>&1; then
+            az group create \
+              --name "${TFSTATE_RG}" \
+              --location "${TFSTATE_LOCATION}"
+          fi
+
+          if ! az storage account show \
+            --name "${TFSTATE_STORAGE_ACCOUNT}" \
+            --resource-group "${TFSTATE_RG}" >/dev/null 2>&1; then
+            az storage account create \
+              --name "${TFSTATE_STORAGE_ACCOUNT}" \
+              --resource-group "${TFSTATE_RG}" \
+              --location "${TFSTATE_LOCATION}" \
+              --sku Standard_LRS \
+              --kind StorageV2 \
+              --min-tls-version TLS1_2 \
+              --allow-blob-public-access false
+          fi
+
+      - name: Get Terraform state storage access key
+        id: tfstate-key
+        run: |
+          set -euo pipefail
+
+          ACCESS_KEY="$(az storage account keys list \
+            --resource-group "${TFSTATE_RG}" \
+            --account-name "${TFSTATE_STORAGE_ACCOUNT}" \
+            --query "[0].value" -o tsv)"
+
+          echo "::add-mask::${ACCESS_KEY}"
+          {
+            echo "access_key<<EOF"
+            echo "${ACCESS_KEY}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Create Terraform state container
+        env:
+          TFSTATE_ACCESS_KEY: ${{ steps.tfstate-key.outputs.access_key }}
+        run: |
+          set -euo pipefail
+
+          if ! az storage container show \
+            --name "${TFSTATE_CONTAINER}" \
+            --account-name "${TFSTATE_STORAGE_ACCOUNT}" \
+            --account-key "${TFSTATE_ACCESS_KEY}" >/dev/null 2>&1; then
+            az storage container create \
+              --name "${TFSTATE_CONTAINER}" \
+              --account-name "${TFSTATE_STORAGE_ACCOUNT}" \
+              --account-key "${TFSTATE_ACCESS_KEY}"
+          fi
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init, validate, and plan
+        working-directory: terraform
+        env:
+          TFSTATE_ACCESS_KEY: ${{ steps.tfstate-key.outputs.access_key }}
+        run: |
+          set -euo pipefail
+
+          export ARM_CLIENT_ID="$(jq -r '.clientId' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_CLIENT_SECRET="$(jq -r '.clientSecret' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_SUBSCRIPTION_ID="$(jq -r '.subscriptionId' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_TENANT_ID="$(jq -r '.tenantId' <<< "${AZURE_CREDENTIALS}")"
+
+          terraform init \
+            -backend-config="resource_group_name=${TFSTATE_RG}" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="access_key=${TFSTATE_ACCESS_KEY}"
+
+          terraform fmt -check
+          terraform validate
+          terraform plan -out=tfplan
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+
+          export ARM_CLIENT_ID="$(jq -r '.clientId' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_CLIENT_SECRET="$(jq -r '.clientSecret' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_SUBSCRIPTION_ID="$(jq -r '.subscriptionId' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_TENANT_ID="$(jq -r '.tenantId' <<< "${AZURE_CREDENTIALS}")"
+
+          terraform apply -auto-approve tfplan
+
+
   # =========================================================
   # Backend Tests
   # =========================================================
@@ -112,6 +237,7 @@ jobs:
     # All backend tests must pass before this job starts
     needs:
       - backend-test
+      - terraform
 
     # Build and push when code is pushed to main or manually triggered
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
@@ -164,3 +290,22 @@ jobs:
         run: |
           docker push \
             ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+
+      - name: Scan image with Docker Scout
+        continue-on-error: true
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          sarif-file: docker-scout-${{ matrix.image }}.sarif
+          summary: true
+          write-comment: false
+          exit-code: false
+
+      - name: Upload Docker Scout results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-scout-${{ matrix.image }}
+          path: docker-scout-${{ matrix.image }}.sarif
+          if-no-files-found: warn
