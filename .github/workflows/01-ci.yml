@@ -362,6 +362,8 @@ jobs:
           summary: true
           write-comment: false
           exit-code: false
+          dockerhub-user: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Upload Docker Scout results
         if: always()
