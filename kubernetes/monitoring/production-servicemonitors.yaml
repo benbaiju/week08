@@ -7,8 +7,16 @@ metadata:
     app: user-service
 spec:
   selector:
-    matchLabels:
-      app: user-service
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - user-service
+      - key: version
+        operator: In
+        values:
+          - blue
+          - green
   endpoints:
     - port: http
       path: /metrics
@@ -23,8 +31,16 @@ metadata:
     app: student-service
 spec:
   selector:
-    matchLabels:
-      app: student-service
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - student-service
+      - key: version
+        operator: In
+        values:
+          - blue
+          - green
   endpoints:
     - port: http
       path: /metrics
@@ -39,8 +55,16 @@ metadata:
     app: lecturer-service
 spec:
   selector:
-    matchLabels:
-      app: lecturer-service
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - lecturer-service
+      - key: version
+        operator: In
+        values:
+          - blue
+          - green
   endpoints:
     - port: http
       path: /metrics
@@ -55,8 +79,16 @@ metadata:
     app: course-service
 spec:
   selector:
-    matchLabels:
-      app: course-service
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - course-service
+      - key: version
+        operator: In
+        values:
+          - blue
+          - green
   endpoints:
     - port: http
       path: /metrics
@@ -71,8 +103,16 @@ metadata:
     app: enrollment-service
 spec:
   selector:
-    matchLabels:
-      app: enrollment-service
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - enrollment-service
+      - key: version
+        operator: In
+        values:
+          - blue
+          - green
   endpoints:
     - port: http
       path: /metrics

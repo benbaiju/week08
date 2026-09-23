@@ -1,17 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: enrollment-service
+  name: enrollment-service-blue
   namespace: production
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: enrollment-service
+      version: blue
   template:
     metadata:
       labels:
         app: enrollment-service
+        version: blue
     spec:
       containers:
         - name: enrollment-service
@@ -19,6 +21,79 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: enrollments
+            - name: POSTGRES_HOST
+              value: enrollment-db
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: JWT_SECRET_KEY
+            - name: JWT_ALGORITHM
+              value: HS256
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enrollment-service-green
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: enrollment-service
+      version: green
+  template:
+    metadata:
+      labels:
+        app: enrollment-service
+        version: green
+    spec:
+      containers:
+        - name: enrollment-service
+          image: placeholder
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
           env:
             - name: POSTGRES_USER
               valueFrom:
@@ -52,9 +127,30 @@ metadata:
   namespace: production
   labels:
     app: enrollment-service
+    version: blue
 spec:
   selector:
     app: enrollment-service
+    version: blue
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: enrollment-service-preview
+  namespace: production
+  labels:
+    app: enrollment-service
+    version: green
+spec:
+  type: ClusterIP
+  selector:
+    app: enrollment-service
+    version: green
   ports:
     - name: http
       port: 8000

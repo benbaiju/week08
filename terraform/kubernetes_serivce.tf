@@ -15,6 +15,10 @@ resource "azurerm_kubernetes_cluster" "aks" {
     type = "SystemAssigned"
   }
 
+  oms_agent {
+    log_analytics_workspace_id = azurerm_log_analytics_workspace.aks.id
+  }
+
   tags = merge(
     var.tags,
     {

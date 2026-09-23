@@ -1,17 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: user-service
+  name: user-service-blue
   namespace: production
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: user-service
+      version: blue
   template:
     metadata:
       labels:
         app: user-service
+        version: blue
     spec:
       containers:
         - name: user-service
@@ -19,6 +21,96 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: users
+            - name: POSTGRES_HOST
+              value: user-db
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: JWT_SECRET_KEY
+            - name: JWT_ALGORITHM
+              value: HS256
+            - name: ACCESS_TOKEN_EXPIRE_MINUTES
+              value: "30"
+            - name: DEFAULT_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_USERNAME
+            - name: DEFAULT_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_EMAIL
+            - name: DEFAULT_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: application-secret
+                  key: DEFAULT_ADMIN_PASSWORD
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service-green
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: user-service
+      version: green
+  template:
+    metadata:
+      labels:
+        app: user-service
+        version: green
+    spec:
+      containers:
+        - name: user-service
+          image: placeholder
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
           env:
             - name: POSTGRES_USER
               valueFrom:
@@ -69,9 +161,30 @@ metadata:
   namespace: production
   labels:
     app: user-service
+    version: blue
 spec:
   selector:
     app: user-service
+    version: blue
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service-preview
+  namespace: production
+  labels:
+    app: user-service
+    version: green
+spec:
+  type: ClusterIP
+  selector:
+    app: user-service
+    version: green
   ports:
     - name: http
       port: 8000

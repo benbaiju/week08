@@ -4,6 +4,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -136,7 +137,19 @@ def root() -> dict[str, str]:
     "/health",
     tags=["Health"],
 )
-def health_check() -> dict[str, str]:
+def health_check():
+    if os.getenv("FORCE_UNHEALTHY") == "true":
+        logger.error(
+            "FORCE_UNHEALTHY active — returning HTTP 503 for /health"
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "service": "user-service",
+            },
+        )
+
     return {
         "status": "healthy",
         "service": "user-service",

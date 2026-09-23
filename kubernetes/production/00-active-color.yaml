@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: active-color
+  namespace: production
+data:
+  active-color: "blue"

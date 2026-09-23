@@ -8,13 +8,103 @@ on:
       - completed
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      simulate_smoke_failure:
+        description: Set FORCE_UNHEALTHY before smoke (gate demo — switch never runs)
+        type: boolean
+        default: false
+      simulate_post_switch_failure:
+        description: Set FORCE_UNHEALTHY after switch (soak fails → rollback + Log Analytics)
+        type: boolean
+        default: false
+
+env:
+  NAMESPACE: production
+  COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  SIMULATE_SMOKE_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_smoke_failure || false }}
+  SIMULATE_POST_SWITCH_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_post_switch_failure || false }}
 
 jobs:
-  deploy-production:
-    name: Deploy to Production
+  determine-colors:
+    name: Determine active and target colors
     runs-on: ubuntu-latest
 
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+
+    environment:
+      name: production
+
+    outputs:
+      active_color: ${{ steps.colors.outputs.active_color }}
+      target_color: ${{ steps.colors.outputs.target_color }}
+      commit_sha: ${{ steps.colors.outputs.commit_sha }}
+
+    steps:
+      - name: Reject mutually exclusive failure simulations
+        run: |
+          if [ "${{ env.SIMULATE_SMOKE_FAILURE }}" = "true" ] && \
+             [ "${{ env.SIMULATE_POST_SWITCH_FAILURE }}" = "true" ]; then
+            echo "Error: simulate_smoke_failure and simulate_post_switch_failure are mutually exclusive"
+            exit 1
+          fi
+
+      - name: Checkout tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT_SHA }}
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Create production namespace
+        run: |
+          kubectl create namespace production \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Ensure active-color ConfigMap exists
+        run: |
+          kubectl apply -f kubernetes/production/00-active-color.yaml
+
+      - name: Read active color and compute target
+        id: colors
+        run: |
+          ACTIVE=$(kubectl get configmap active-color \
+            -n "${{ env.NAMESPACE }}" \
+            -o jsonpath='{.data.active-color}')
+
+          if [ -z "${ACTIVE}" ]; then
+            ACTIVE="blue"
+          fi
+
+          if [ "${ACTIVE}" = "blue" ]; then
+            TARGET="green"
+          else
+            TARGET="blue"
+          fi
+
+          echo "active_color=${ACTIVE}" >> "${GITHUB_OUTPUT}"
+          echo "target_color=${TARGET}" >> "${GITHUB_OUTPUT}"
+          echo "commit_sha=${{ env.COMMIT_SHA }}" >> "${GITHUB_OUTPUT}"
+
+          echo "Active color: ${ACTIVE}"
+          echo "Target color: ${TARGET}"
+          echo "Commit SHA: ${{ env.COMMIT_SHA }}"
+
+  deploy-target:
+    name: Deploy target color
+    runs-on: ubuntu-latest
+    needs: determine-colors
 
     environment:
       name: production
@@ -23,7 +113,7 @@ jobs:
       - name: Checkout tested commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.determine-colors.outputs.commit_sha }}
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -75,80 +165,619 @@ jobs:
           kubectl apply \
             -f kubernetes/production/
 
-      - name: Update frontend image
+      - name: Remove legacy single-color Deployments
         run: |
-          kubectl set image deployment/frontend \
-            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha }} \
-            -n production
+          kubectl delete deployment \
+            frontend \
+            user-service \
+            student-service \
+            lecturer-service \
+            course-service \
+            enrollment-service \
+            -n "${{ env.NAMESPACE }}" \
+            --ignore-not-found
 
-      - name: Update user-service image
+      - name: Align Service selectors with active and target colors
+        env:
+          ACTIVE: ${{ needs.determine-colors.outputs.active_color }}
+          TARGET: ${{ needs.determine-colors.outputs.target_color }}
         run: |
-          kubectl set image deployment/user-service \
-            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha }} \
-            -n production
+          SERVICES="frontend user-service student-service lecturer-service course-service enrollment-service"
 
-      - name: Update student-service image
-        run: |
-          kubectl set image deployment/student-service \
-            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event.workflow_run.head_sha }} \
-            -n production
+          for svc in ${SERVICES}; do
+            kubectl patch service "${svc}" \
+              -n "${{ env.NAMESPACE }}" \
+              --type merge \
+              -p "{\"metadata\":{\"labels\":{\"version\":\"${ACTIVE}\"}},\"spec\":{\"selector\":{\"app\":\"${svc}\",\"version\":\"${ACTIVE}\"}}}"
 
-      - name: Update lecturer-service image
-        run: |
-          kubectl set image deployment/lecturer-service \
-            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event.workflow_run.head_sha }} \
-            -n production
+            kubectl patch service "${svc}-preview" \
+              -n "${{ env.NAMESPACE }}" \
+              --type merge \
+              -p "{\"metadata\":{\"labels\":{\"version\":\"${TARGET}\"}},\"spec\":{\"selector\":{\"app\":\"${svc}\",\"version\":\"${TARGET}\"}}}"
+          done
 
-      - name: Update course-service image
+      - name: Update target images
+        env:
+          TARGET: ${{ needs.determine-colors.outputs.target_color }}
+          SHA: ${{ needs.determine-colors.outputs.commit_sha }}
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
         run: |
-          kubectl set image deployment/course-service \
-            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event.workflow_run.head_sha }} \
-            -n production
+          kubectl set image deployment/frontend-"${TARGET}" \
+            frontend="${ACR}/koalatech-frontend:${SHA}" \
+            -n "${{ env.NAMESPACE }}"
 
-      - name: Update enrollment-service image
-        run: |
-          kubectl set image deployment/enrollment-service \
-            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event.workflow_run.head_sha }} \
-            -n production
+          kubectl set image deployment/user-service-"${TARGET}" \
+            user-service="${ACR}/koalatech-user-service:${SHA}" \
+            -n "${{ env.NAMESPACE }}"
 
-      - name: Wait for frontend rollout
-        run: |
-          kubectl rollout status deployment/frontend \
-            -n production \
-            --timeout=300s
+          kubectl set image deployment/student-service-"${TARGET}" \
+            student-service="${ACR}/koalatech-student-service:${SHA}" \
+            -n "${{ env.NAMESPACE }}"
 
-      - name: Wait for user-service rollout
-        run: |
-          kubectl rollout status deployment/user-service \
-            -n production \
-            --timeout=300s
+          kubectl set image deployment/lecturer-service-"${TARGET}" \
+            lecturer-service="${ACR}/koalatech-lecturer-service:${SHA}" \
+            -n "${{ env.NAMESPACE }}"
 
-      - name: Wait for student-service rollout
-        run: |
-          kubectl rollout status deployment/student-service \
-            -n production \
-            --timeout=300s
+          kubectl set image deployment/course-service-"${TARGET}" \
+            course-service="${ACR}/koalatech-course-service:${SHA}" \
+            -n "${{ env.NAMESPACE }}"
 
-      - name: Wait for lecturer-service rollout
-        run: |
-          kubectl rollout status deployment/lecturer-service \
-            -n production \
-            --timeout=300s
+          kubectl set image deployment/enrollment-service-"${TARGET}" \
+            enrollment-service="${ACR}/koalatech-enrollment-service:${SHA}" \
+            -n "${{ env.NAMESPACE }}"
 
-      - name: Wait for course-service rollout
+      - name: Set FORCE_UNHEALTHY on target color
+        env:
+          TARGET: ${{ needs.determine-colors.outputs.target_color }}
         run: |
-          kubectl rollout status deployment/course-service \
-            -n production \
-            --timeout=300s
+          BACKENDS="user-service student-service lecturer-service course-service enrollment-service"
 
-      - name: Wait for enrollment-service rollout
+          if [ "${{ env.SIMULATE_SMOKE_FAILURE }}" = "true" ]; then
+            echo "simulate_smoke_failure enabled — setting FORCE_UNHEALTHY=true on target backends (pre-smoke gate)"
+            for svc in ${BACKENDS}; do
+              kubectl set env deployment/"${svc}-${TARGET}" \
+                FORCE_UNHEALTHY=true \
+                -n "${{ env.NAMESPACE }}"
+            done
+          else
+            echo "Clearing FORCE_UNHEALTHY on target backends"
+            for svc in ${BACKENDS}; do
+              kubectl set env deployment/"${svc}-${TARGET}" \
+                FORCE_UNHEALTHY- \
+                -n "${{ env.NAMESPACE }}"
+            done
+          fi
+
+      - name: Wait for target rollouts
+        env:
+          TARGET: ${{ needs.determine-colors.outputs.target_color }}
         run: |
-          kubectl rollout status deployment/enrollment-service \
-            -n production \
-            --timeout=300s
+          DEPLOYMENTS="frontend user-service student-service lecturer-service course-service enrollment-service"
+          FAILED=0
+
+          for svc in ${DEPLOYMENTS}; do
+            if ! kubectl rollout status deployment/"${svc}-${TARGET}" \
+              -n "${{ env.NAMESPACE }}" \
+              --timeout=300s; then
+              echo "Rollout not ready for ${svc}-${TARGET}"
+              FAILED=1
+            fi
+          done
+
+          if [ "${FAILED}" -ne 0 ]; then
+            if [ "${{ env.SIMULATE_SMOKE_FAILURE }}" = "true" ]; then
+              echo "Rollout incomplete expected under simulate_smoke_failure — continuing to smoke-target"
+            else
+              exit 1
+            fi
+          fi
 
       - name: Show production resources
         run: |
           kubectl get pods -n production
           kubectl get services -n production
           kubectl get pvc -n production
+
+  smoke-target:
+    name: Smoke test target (preview)
+    runs-on: ubuntu-latest
+    needs: [determine-colors, deploy-target]
+
+    environment:
+      name: production
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Curl preview Services /health
+        run: |
+          set -euo pipefail
+
+          kubectl delete pod smoke-target-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --ignore-not-found
+
+          kubectl run smoke-target-curl \
+            --image=curlimages/curl:8.5.0 \
+            --restart=Never \
+            -n "${{ env.NAMESPACE }}" \
+            --command -- sleep 120
+
+          kubectl wait --for=condition=Ready pod/smoke-target-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --timeout=60s
+
+          set +e
+          kubectl exec smoke-target-curl \
+            -n "${{ env.NAMESPACE }}" \
+            -- sh -c '
+              set -e
+              fail=0
+              check() {
+                name="$1"
+                url="$2"
+                code=$(curl -s -o /tmp/body -w "%{http_code}" "$url" || true)
+                echo "${name}: HTTP ${code}"
+                if [ "${code}" != "200" ]; then
+                  echo "FAIL ${name} — expected 200"
+                  cat /tmp/body || true
+                  fail=1
+                fi
+              }
+              check frontend-preview http://frontend-preview.production.svc.cluster.local/health
+              check user-service-preview http://user-service-preview.production.svc.cluster.local:8000/health
+              check student-service-preview http://student-service-preview.production.svc.cluster.local:8000/health
+              check lecturer-service-preview http://lecturer-service-preview.production.svc.cluster.local:8000/health
+              check course-service-preview http://course-service-preview.production.svc.cluster.local:8000/health
+              check enrollment-service-preview http://enrollment-service-preview.production.svc.cluster.local:8000/health
+              exit "${fail}"
+            '
+          STATUS=$?
+          set -e
+
+          kubectl delete pod smoke-target-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --ignore-not-found
+
+          exit "${STATUS}"
+
+  switch-traffic:
+    name: Switch traffic to target color
+    runs-on: ubuntu-latest
+    needs: [determine-colors, smoke-target]
+
+    environment:
+      name: production
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Patch live and preview Service selectors
+        env:
+          ACTIVE: ${{ needs.determine-colors.outputs.active_color }}
+          TARGET: ${{ needs.determine-colors.outputs.target_color }}
+        run: |
+          SERVICES="frontend user-service student-service lecturer-service course-service enrollment-service"
+
+          for svc in ${SERVICES}; do
+            kubectl patch service "${svc}" \
+              -n "${{ env.NAMESPACE }}" \
+              --type merge \
+              -p "{\"metadata\":{\"labels\":{\"version\":\"${TARGET}\"}},\"spec\":{\"selector\":{\"app\":\"${svc}\",\"version\":\"${TARGET}\"}}}"
+
+            kubectl patch service "${svc}-preview" \
+              -n "${{ env.NAMESPACE }}" \
+              --type merge \
+              -p "{\"metadata\":{\"labels\":{\"version\":\"${ACTIVE}\"}},\"spec\":{\"selector\":{\"app\":\"${svc}\",\"version\":\"${ACTIVE}\"}}}"
+          done
+
+      - name: Update active-color ConfigMap
+        env:
+          TARGET: ${{ needs.determine-colors.outputs.target_color }}
+        run: |
+          kubectl create configmap active-color \
+            -n "${{ env.NAMESPACE }}" \
+            --from-literal=active-color="${TARGET}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+          echo "Live color is now ${TARGET}"
+
+  soak-and-rollback:
+    name: Soak live traffic and auto-rollback
+    runs-on: ubuntu-latest
+    needs: [determine-colors, switch-traffic]
+
+    environment:
+      name: production
+
+    outputs:
+      outcome: ${{ steps.soak.outputs.outcome }}
+      live_color: ${{ steps.soak.outputs.live_color }}
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Inject post-switch FORCE_UNHEALTHY on live color
+        if: env.SIMULATE_POST_SWITCH_FAILURE == 'true'
+        env:
+          LIVE: ${{ needs.determine-colors.outputs.target_color }}
+        run: |
+          set -euo pipefail
+          echo "simulate_post_switch_failure enabled — marking live (${LIVE}) backends unhealthy after switch"
+          BACKENDS="user-service student-service lecturer-service course-service enrollment-service"
+
+          for svc in ${BACKENDS}; do
+            kubectl set env deployment/"${svc}-${LIVE}" \
+              FORCE_UNHEALTHY=true \
+              -n "${{ env.NAMESPACE }}"
+          done
+
+          echo "Waiting 45s for FORCE_UNHEALTHY pods to roll and accept traffic..."
+          sleep 45
+
+          kubectl delete pod post-switch-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --ignore-not-found
+
+          kubectl run post-switch-curl \
+            --image=curlimages/curl:8.5.0 \
+            --restart=Never \
+            -n "${{ env.NAMESPACE }}" \
+            --command -- sleep 60
+
+          kubectl wait --for=condition=Ready pod/post-switch-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --timeout=60s
+
+          kubectl exec post-switch-curl \
+            -n "${{ env.NAMESPACE }}" \
+            -- sh -c '
+              for i in 1 2 3; do
+                curl -s -o /dev/null http://user-service.production.svc.cluster.local:8000/health || true
+                curl -s -o /dev/null http://student-service.production.svc.cluster.local:8000/health || true
+                curl -s -o /dev/null http://lecturer-service.production.svc.cluster.local:8000/health || true
+                curl -s -o /dev/null http://course-service.production.svc.cluster.local:8000/health || true
+                curl -s -o /dev/null http://enrollment-service.production.svc.cluster.local:8000/health || true
+                sleep 2
+              done
+            ' || true
+
+          kubectl delete pod post-switch-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --ignore-not-found
+
+      - name: Query Log Analytics for HTTP failures on newly-live pods
+        continue-on-error: true
+        env:
+          LIVE: ${{ needs.determine-colors.outputs.target_color }}
+          WORKSPACE_ID: ${{ vars.LOG_ANALYTICS_WORKSPACE_ID }}
+        run: |
+          set -u
+
+          if [ -z "${WORKSPACE_ID}" ]; then
+            echo "Warning: vars.LOG_ANALYTICS_WORKSPACE_ID is not set — skipping Log Analytics query"
+            echo "Set it from Terraform output log_analytics_workspace_id after apply."
+            exit 0
+          fi
+
+          az extension add --name log-analytics --upgrade --yes >/dev/null 2>&1 || true
+
+          QUERY=$(cat <<EOF
+          ContainerLogV2
+          | where TimeGenerated > ago(5m)
+          | where PodNamespace == "production"
+          | where PodName contains "${LIVE}"
+          | where LogMessage matches regex @"(?i)(\berror\b|HTTP/[0-9.]+[^\n]*\s5[0-9]{2}\b|\b5[0-9]{2}\b)"
+          | summarize FailureCount = count()
+          EOF
+          )
+
+          echo "Log Analytics workspace ID: ${WORKSPACE_ID}"
+          echo "Newly-live color: ${LIVE}"
+          echo "KQL (last 5 minutes, production pods containing '${LIVE}'):"
+          echo "${QUERY}"
+          echo "---"
+
+          set +e
+          RESULT=$(az monitor log-analytics query \
+            --workspace "${WORKSPACE_ID}" \
+            --analytics-query "${QUERY}" \
+            --timespan PT5M \
+            -o json 2>&1)
+          STATUS=$?
+          set -e
+
+          if [ "${STATUS}" -ne 0 ]; then
+            echo "Warning: Log Analytics query failed (non-blocking):"
+            echo "${RESULT}"
+         
+            echo "Log Analytics HTTP/error failure count: unavailable"
+         
+            exit 0
+          fi
+
+          echo "Raw query result:"
+          echo "${RESULT}"
+
+          COUNT=$(echo "${RESULT}" | jq -r '
+            if type == "array" and length > 0 then
+              (.[0].FailureCount // .[0].Count // .[0].failureCount // "0")
+            else
+              "0"
+            end
+          ')
+
+       
+          echo "Log Analytics HTTP/error failure count (last 5m, color=${LIVE}): ${COUNT}"
+       
+
+      - name: Soak live /health for 90s
+        id: soak
+        env:
+          PREVIOUS: ${{ needs.determine-colors.outputs.active_color }}
+          LIVE: ${{ needs.determine-colors.outputs.target_color }}
+        run: |
+          set -euo pipefail
+
+          echo "live_color=${LIVE}" >> "${GITHUB_OUTPUT}"
+
+          kubectl delete pod soak-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --ignore-not-found
+
+          kubectl run soak-curl \
+            --image=curlimages/curl:8.5.0 \
+            --restart=Never \
+            -n "${{ env.NAMESPACE }}" \
+            --command -- sleep 150
+
+          kubectl wait --for=condition=Ready pod/soak-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --timeout=60s
+
+          SOAK_FAILED=0
+          END=$((SECONDS + 90))
+
+          while [ "${SECONDS}" -lt "${END}" ]; do
+            set +e
+            kubectl exec soak-curl \
+              -n "${{ env.NAMESPACE }}" \
+              -- sh -c '
+                fail=0
+                check() {
+                  name="$1"
+                  url="$2"
+                  code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)
+                  echo "${name}: HTTP ${code}"
+                  if [ "${code}" != "200" ]; then
+                    fail=1
+                  fi
+                }
+                check frontend http://frontend.production.svc.cluster.local/health
+                check user-service http://user-service.production.svc.cluster.local:8000/health
+                check student-service http://student-service.production.svc.cluster.local:8000/health
+                check lecturer-service http://lecturer-service.production.svc.cluster.local:8000/health
+                check course-service http://course-service.production.svc.cluster.local:8000/health
+                check enrollment-service http://enrollment-service.production.svc.cluster.local:8000/health
+                exit "${fail}"
+              '
+            STATUS=$?
+            set -e
+
+            if [ "${STATUS}" -ne 0 ]; then
+              echo "Soak health check failed"
+              SOAK_FAILED=1
+              break
+            fi
+
+            echo "Soak OK — sleeping 10s"
+            sleep 10
+          done
+
+          kubectl delete pod soak-curl \
+            -n "${{ env.NAMESPACE }}" \
+            --ignore-not-found
+
+          if [ "${SOAK_FAILED}" -eq 0 ]; then
+            echo "outcome=success" >> "${GITHUB_OUTPUT}"
+            echo "Soak completed successfully — live color ${LIVE}"
+            exit 0
+          fi
+
+          echo "Rolling back traffic to ${PREVIOUS}"
+          SERVICES="frontend user-service student-service lecturer-service course-service enrollment-service"
+
+          for svc in ${SERVICES}; do
+            kubectl patch service "${svc}" \
+              -n "${{ env.NAMESPACE }}" \
+              --type merge \
+              -p "{\"metadata\":{\"labels\":{\"version\":\"${PREVIOUS}\"}},\"spec\":{\"selector\":{\"app\":\"${svc}\",\"version\":\"${PREVIOUS}\"}}}"
+
+            kubectl patch service "${svc}-preview" \
+              -n "${{ env.NAMESPACE }}" \
+              --type merge \
+              -p "{\"metadata\":{\"labels\":{\"version\":\"${LIVE}\"}},\"spec\":{\"selector\":{\"app\":\"${svc}\",\"version\":\"${LIVE}\"}}}"
+          done
+
+          kubectl create configmap active-color \
+            -n "${{ env.NAMESPACE }}" \
+            --from-literal=active-color="${PREVIOUS}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+          echo "outcome=rollback" >> "${GITHUB_OUTPUT}"
+          echo "live_color=${PREVIOUS}" >> "${GITHUB_OUTPUT}"
+          echo "Rollback complete — live color restored to ${PREVIOUS}"
+          exit 0
+
+  notify:
+    name: Discord notification
+    runs-on: ubuntu-latest
+    needs:
+      - determine-colors
+      - deploy-target
+      - smoke-target
+      - switch-traffic
+      - soak-and-rollback
+    if: always()
+
+    steps:
+      - name: Notify success
+        if: >
+          needs.soak-and-rollback.result == 'success' &&
+          needs.soak-and-rollback.outputs.outcome == 'success'
+        env:
+          LIVE_COLOR: ${{ needs.soak-and-rollback.outputs.live_color }}
+          COMMIT_SHA: ${{ needs.determine-colors.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=$(cat <<EOF
+          {
+            "embeds": [{
+              "title": "Production deploy succeeded",
+              "color": 3066993,
+              "fields": [
+                {"name": "Status", "value": "Blue/green switch completed and soak passed (no failure simulation)", "inline": false},
+                {"name": "Scenario", "value": "normal deploy", "inline": true},
+                {"name": "Live color", "value": "${LIVE_COLOR}", "inline": true},
+                {"name": "Commit SHA", "value": "${COMMIT_SHA}", "inline": true}
+              ]
+            }]
+          }
+          EOF
+          )
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}")
+
+          if [ "${HTTP_CODE}" != "204" ]; then
+            echo "Warning: Discord webhook returned HTTP ${HTTP_CODE} (expected 204)"
+          fi
+
+      - name: Notify rollback
+        if: needs.soak-and-rollback.outputs.outcome == 'rollback'
+        env:
+          LIVE_COLOR: ${{ needs.soak-and-rollback.outputs.live_color }}
+          COMMIT_SHA: ${{ needs.determine-colors.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ env.SIMULATE_POST_SWITCH_FAILURE }}" = "true" ]; then
+            STATUS_TEXT="Post-switch failure simulation — live color marked unhealthy after switch; soak failed and traffic reverted"
+            SCENARIO="simulate_post_switch_failure (rollback demo)"
+            TITLE="Production deploy rolled back (post-switch failure)"
+          else
+            STATUS_TEXT="Post-switch soak failed — traffic reverted to previous color"
+            SCENARIO="unplanned soak failure"
+            TITLE="Production deploy rolled back"
+          fi
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "embeds": [{
+              "title": "${TITLE}",
+              "color": 15158332,
+              "fields": [
+                {"name": "Status", "value": "${STATUS_TEXT}", "inline": false},
+                {"name": "Scenario", "value": "${SCENARIO}", "inline": true},
+                {"name": "Live color", "value": "${LIVE_COLOR}", "inline": true},
+                {"name": "Commit SHA", "value": "${COMMIT_SHA}", "inline": true}
+              ]
+            }]
+          }
+          EOF
+          )
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}")
+
+          if [ "${HTTP_CODE}" != "204" ]; then
+            echo "Warning: Discord webhook returned HTTP ${HTTP_CODE} (expected 204)"
+          fi
+
+      - name: Notify hard failure
+        if: >
+          needs.determine-colors.result == 'failure' ||
+          needs.deploy-target.result == 'failure' ||
+          needs.smoke-target.result == 'failure' ||
+          needs.switch-traffic.result == 'failure' ||
+          (needs.soak-and-rollback.result == 'failure' &&
+           needs.soak-and-rollback.outputs.outcome != 'rollback')
+        env:
+          LIVE_COLOR: ${{ needs.determine-colors.outputs.active_color || 'unknown' }}
+          COMMIT_SHA: ${{ needs.determine-colors.outputs.commit_sha || env.COMMIT_SHA }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ env.SIMULATE_SMOKE_FAILURE }}" = "true" ]; then
+            STATUS_TEXT="Smoke gate failure simulation — FORCE_UNHEALTHY set pre-smoke; switch-traffic never ran; live traffic unchanged"
+            SCENARIO="simulate_smoke_failure (gate demo)"
+            TITLE="Production deploy failed (smoke gate)"
+          else
+            STATUS_TEXT="Deploy aborted before or during switch — live traffic unchanged"
+            SCENARIO="hard failure"
+            TITLE="Production deploy failed"
+          fi
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "embeds": [{
+              "title": "${TITLE}",
+              "color": 15158332,
+              "fields": [
+                {"name": "Status", "value": "${STATUS_TEXT}", "inline": false},
+                {"name": "Scenario", "value": "${SCENARIO}", "inline": true},
+                {"name": "Live color", "value": "${LIVE_COLOR}", "inline": true},
+                {"name": "Commit SHA", "value": "${COMMIT_SHA}", "inline": true}
+              ]
+            }]
+          }
+          EOF
+          )
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" \
+            "${{ secrets.DISCORD_WEBHOOK_URL }}")
+
+          if [ "${HTTP_CODE}" != "204" ]; then
+            echo "Warning: Discord webhook returned HTTP ${HTTP_CODE} (expected 204)"
+          fi

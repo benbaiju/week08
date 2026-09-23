@@ -33,7 +33,10 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ./user-service/.env
+      - path: ./user-service/.env
+        required: false
+    environment:
+      FORCE_UNHEALTHY: ${FORCE_UNHEALTHY:-}
     depends_on:
       user-db:
         condition: service_healthy
@@ -75,7 +78,10 @@ services:
     ports:
       - "8001:8000"
     env_file:
-      - ./student-service/.env
+      - path: ./student-service/.env
+        required: false
+    environment:
+      FORCE_UNHEALTHY: ${FORCE_UNHEALTHY:-}
     depends_on:
       student-db:
         condition: service_healthy
@@ -117,7 +123,10 @@ services:
     ports:
       - "8002:8000"
     env_file:
-      - ./lecturer-service/.env
+      - path: ./lecturer-service/.env
+        required: false
+    environment:
+      FORCE_UNHEALTHY: ${FORCE_UNHEALTHY:-}
     depends_on:
       lecturer-db:
         condition: service_healthy
@@ -159,7 +168,10 @@ services:
     ports:
       - "8003:8000"
     env_file:
-      - ./course-service/.env
+      - path: ./course-service/.env
+        required: false
+    environment:
+      FORCE_UNHEALTHY: ${FORCE_UNHEALTHY:-}
     depends_on:
       course-db:
         condition: service_healthy
@@ -201,7 +213,10 @@ services:
     ports:
       - "8004:8000"
     env_file:
-      - ./enrollment-service/.env
+      - path: ./enrollment-service/.env
+        required: false
+    environment:
+      FORCE_UNHEALTHY: ${FORCE_UNHEALTHY:-}
     depends_on:
       enrollment-db:
         condition: service_healthy
