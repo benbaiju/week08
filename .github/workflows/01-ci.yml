@@ -136,6 +136,10 @@ jobs:
 
           terraform apply -auto-approve tfplan
 
+          WORKSPACE_ID="$(terraform output -raw log_analytics_workspace_id)"
+          WORKSPACE_NAME="$(terraform output -raw log_analytics_workspace_name)"
+          echo "Set repo variable LOG_ANALYTICS_WORKSPACE_ID=${WORKSPACE_ID} (workspace name: ${WORKSPACE_NAME})"
+
 
   # =========================================================
   # Backend Tests
