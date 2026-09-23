@@ -481,17 +481,31 @@ jobs:
         continue-on-error: true
         env:
           LIVE: ${{ needs.determine-colors.outputs.target_color }}
-          WORKSPACE_ID: ${{ vars.LOG_ANALYTICS_WORKSPACE_ID }}
+          AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
         run: |
           set -u
 
-          if [ -z "${WORKSPACE_ID}" ]; then
-            echo "Warning: vars.LOG_ANALYTICS_WORKSPACE_ID is not set — skipping Log Analytics query"
-            echo "Set it from Terraform output log_analytics_workspace_id after apply."
+          az extension add --name log-analytics --upgrade --yes >/dev/null 2>&1 || true
+
+          WORKSPACE_NAME="${AKS_CLUSTER_NAME}-logs"
+
+          set +e
+          WORKSPACE_ID=$(az monitor log-analytics workspace show \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --workspace-name "${WORKSPACE_NAME}" \
+            --query customerId -o tsv 2>&1)
+          LOOKUP_STATUS=$?
+          set -e
+
+          if [ "${LOOKUP_STATUS}" -ne 0 ] || [ -z "${WORKSPACE_ID}" ]; then
+            echo "Warning: could not retrieve Log Analytics workspace ID from Azure skipping query"
+            echo "Resource group: ${AKS_RESOURCE_GROUP}"
+            echo "Workspace name: ${WORKSPACE_NAME}"
+            echo "${WORKSPACE_ID}"
+            echo "Log Analytics HTTP/error failure count: unavailable"
             exit 0
           fi
-
-          az extension add --name log-analytics --upgrade --yes >/dev/null 2>&1 || true
 
           QUERY=$(cat <<EOF
           ContainerLogV2
@@ -503,6 +517,7 @@ jobs:
           EOF
           )
 
+          echo "Log Analytics workspace: ${WORKSPACE_NAME}"
           echo "Log Analytics workspace ID: ${WORKSPACE_ID}"
           echo "Newly-live color: ${LIVE}"
           echo "KQL (last 5 minutes, production pods containing '${LIVE}'):"
