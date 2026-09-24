@@ -54,10 +54,61 @@ jobs:
           echo "Unable to find staging frontend IP."
           exit 1
 
-      - name: Test frontend
+      - name: Test frontend /health
         run: |
           curl \
             --fail \
             --retry 10 \
             --retry-delay 5 \
-            http://${{ env.FRONTEND_IP }}
+            "http://${{ env.FRONTEND_IP }}/health"
+
+      - name: Test staging services /health
+        run: |
+          set -euo pipefail
+
+          kubectl delete pod staging-smoke-curl \
+            -n staging \
+            --ignore-not-found
+
+          kubectl run staging-smoke-curl \
+            --image=curlimages/curl:8.5.0 \
+            --restart=Never \
+            -n staging \
+            --command -- sleep 120
+
+          kubectl wait --for=condition=Ready pod/staging-smoke-curl \
+            -n staging \
+            --timeout=60s
+
+          set +e
+          kubectl exec staging-smoke-curl \
+            -n staging \
+            -- sh -c '
+              fail=0
+              check() {
+                name="$1"
+                url="$2"
+                code=$(curl -s -o /tmp/body -w "%{http_code}" "$url" || true)
+                echo "${name}: HTTP ${code}"
+                if [ "${code}" != "200" ]; then
+                  echo "FAIL ${name} — expected 200"
+                  cat /tmp/body || true
+                  fail=1
+                fi
+              }
+              check frontend http://frontend.staging.svc.cluster.local/health
+              check user-service http://user-service.staging.svc.cluster.local:8000/health
+              check student-service http://student-service.staging.svc.cluster.local:8000/health
+              check lecturer-service http://lecturer-service.staging.svc.cluster.local:8000/health
+              check course-service http://course-service.staging.svc.cluster.local:8000/health
+              check enrollment-service http://enrollment-service.staging.svc.cluster.local:8000/health
+              exit "${fail}"
+            '
+          STATUS=$?
+          set -e
+
+          kubectl delete pod staging-smoke-curl \
+            -n staging \
+            --ignore-not-found
+
+          exit "${STATUS}"
