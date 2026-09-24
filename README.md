@@ -20,6 +20,8 @@ The first three workflows run automatically.
 
 Production deployment is intentionally manual.
 
+Task 10.3HD keeps those four workflows and adds `05-destroy-infra.yml`. Production can still be started by hand, and it also starts automatically after a successful staging test. 
+
 ---
 
 # 2. Prepare the Infrastructure
@@ -142,6 +144,24 @@ The name of your AKS cluster.
 
 ---
 
+### TFSTATE_RG
+
+The Azure resource group that stores Terraform remote state.
+
+---
+
+### TFSTATE_STORAGE_ACCOUNT
+
+The Azure Storage Account that stores Terraform remote state.
+
+---
+
+### TFSTATE_CONTAINER
+
+The blob container inside that storage account (for example `tfstate`).
+
+---
+
 # 7. Repository Secret
 
 Under:
@@ -160,6 +180,18 @@ AZURE_CREDENTIALS
 ```
 
 This contains the Service Principal authentication JSON.
+
+Also create these repository secrets:
+
+```text
+DISCORD_WEBHOOK_URL
+DOCKERHUB_USERNAME
+DOCKERHUB_TOKEN
+```
+
+`DISCORD_WEBHOOK_URL` is used by production and destroy workflows to send Discord alerts.
+
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` are used by Docker Scout during CI.
 
 ---
 
@@ -228,6 +260,12 @@ The final GitHub configuration should be:
 | Repository Variable           | `ACR_LOGIN_SERVER`                |
 | Repository Variable           | `AKS_RESOURCE_GROUP`              |
 | Repository Variable           | `AKS_CLUSTER_NAME`                |
+| Repository Variable           | `TFSTATE_RG`                      |
+| Repository Variable           | `TFSTATE_STORAGE_ACCOUNT`         |
+| Repository Variable           | `TFSTATE_CONTAINER`               |
+| Repository Secret             | `DISCORD_WEBHOOK_URL`             |
+| Repository Secret             | `DOCKERHUB_USERNAME`              |
+| Repository Secret             | `DOCKERHUB_TOKEN`                 |
 | Staging Environment Secret    | `POSTGRES_USER`                   |
 | Staging Environment Secret    | `POSTGRES_PASSWORD`               |
 | Staging Environment Secret    | `JWT_SECRET_KEY`                  |
@@ -256,6 +294,12 @@ The repository contains four workflow files:
     ├── 02-deploy-staging.yml
     ├── 03-staging-test.yml
     └── 04-deploy-production.yml
+```
+
+Task 10.3HD also adds:
+
+```text
+    └── 05-destroy-infra.yml
 ```
 
 ---
@@ -297,6 +341,8 @@ Copy the returned SHA and provide it as the `image_tag` when manually running th
 
 > Make sure the SHA belongs to the version that successfully passed the staging pipeline.
 
+Task 10.3HD no longer uses an `image_tag` input. The production workflow checks out `workflow_run.head_sha` or `github.sha` and deploys that SHA.
+
 
 Run the production workflow and verify that it completes successfully.
 
@@ -311,3 +357,190 @@ After the production deployment completes:
 - Access the production application.
 - Confirm that the application is working correctly.
 - Verify that production is running the same image SHA that was tested in staging.
+
+---
+
+# 15. Task 10.3HD additions
+
+The Week 08 Continuous Delivery path above is still the base pipeline.
+
+Task 10.3HD extends it with:
+
+* Terraform applied from `01 - CI` (AKS, ACR, storage, Log Analytics);
+* Docker Scout image scans after the images are pushed;
+* Prometheus and Grafana installed when staging deploys;
+* automatic production promotion after staging tests pass;
+* blue/green production Deployments with live and preview Services;
+* a 90 second live `/health` soak plus Azure Log Analytics error checks;
+* automatic rollback if soak or logs fail;
+* Discord notifications for success, rollback, and hard failure;
+* a manual `05 - Destroy infra` workflow.
+
+Production still uses the **same Docker images** that passed staging. Images are **not rebuilt** for production.
+
+---
+
+# 16. What each workflow does now
+
+### 01 - CI
+
+Runs on push to `main`, or from **Actions → 01 - CI → Run workflow**.
+
+1. Bootstraps Terraform state storage from `TFSTATE_RG`, `TFSTATE_STORAGE_ACCOUNT`, and `TFSTATE_CONTAINER`.
+2. Runs `terraform init`, `fmt`, `validate`, `plan`, and `apply`.
+3. Runs pytest for every backend service.
+4. Runs `npm run test:run` for the frontend.
+5. Builds and pushes `koalatech-*` images tagged with `${{ github.sha }}`.
+6. Scans those images with Docker Scout (`continue-on-error`).
+
+### 02 - Deploy to Staging
+
+Starts automatically when `01 - CI` succeeds on `main`.
+
+1. Applies `kubernetes/staging/`.
+2. Sets every staging Deployment to the tested commit SHA.
+3. Waits for rollouts.
+4. Installs `kube-prometheus-stack` into the `monitoring` namespace.
+5. Applies `kubernetes/monitoring/staging-servicemonitors.yaml`.
+
+### 03 - Test Staging
+
+Starts automatically when `02 - Deploy to Staging` succeeds on `main`.
+
+1. Waits for the staging frontend LoadBalancer IP.
+2. Curls `http://<staging-frontend-ip>/health`.
+3. Curls `/health` in-cluster for frontend and all five backend services.
+
+### 04 - Deploy to Production
+
+Starts automatically when `03 - Test Staging` succeeds on `main`.
+
+It can also be started manually from **Actions → 04 - Deploy to Production → Run workflow**.
+
+Manual runs do **not** ask for an `image_tag`. The workflow uses:
+
+* `github.event.workflow_run.head_sha` when it is started by the staging test workflow;
+* `github.sha` when it is started by hand.
+
+Optional mutually exclusive demo flags on a manual run:
+
+| Input | What it does |
+| ----- | ------------ |
+| `simulate_smoke_failure` | Sets `FORCE_UNHEALTHY` before preview smoke. The switch never runs. |
+| `simulate_post_switch_failure` | Sets `FORCE_UNHEALTHY` after the switch. Soak fails, then rollback and Discord. |
+| `simulate_log_errors` | Hits `/demo/error` after the switch. `/health` stays 200. Log Analytics over threshold 5 triggers rollback. |
+
+Do not enable more than one flag in the same run.
+
+### 05 - Destroy infra
+
+Manual only.
+
+Go to:
+
+```text
+GitHub Repository
+→ Actions
+→ 05 - Destroy infra
+→ Run workflow
+```
+
+Type `destroy` in the confirmation box.
+
+The workflow runs `terraform destroy`, then deletes the Terraform state resource group, and sends a Discord notification.
+
+---
+
+# 17. Production blue/green
+
+Production keeps two complete copies of each app:
+
+* `*-blue` Deployments
+* `*-green` Deployments
+
+The live Service (`frontend`, `user-service`, and so on) selects the **active** colour.
+
+The preview Service (`frontend-preview`, `user-service-preview`, and so on) selects the **target** colour.
+
+The active colour is stored in:
+
+```text
+configmap/active-color
+namespace: production
+```
+
+The production job order is:
+
+1. **Determine active and target colors** — read `active-color`, pick the other colour as the target.
+2. **Deploy target color** — apply `kubernetes/production/`, set target images to the tested SHA, wait for rollouts.
+3. **Smoke test target (preview)** — curl preview `/health` (and frontend/user-service `/`) before any live traffic moves.
+4. **Switch traffic to target color** — patch live Service selectors to the target colour and write `active-color`.
+5. **Soak live traffic and auto-rollback** — poll live `/health` for 90 seconds, then query Log Analytics. If soak or logs fail, selectors go back to the previous colour.
+6. **Discord notification** — success, rollback, or hard failure.
+
+Verify production colour and images after a run:
+
+```bash
+kubectl get configmap active-color -n production -o yaml
+kubectl get deploy -n production
+kubectl get svc -n production
+kubectl get pods -n production -o wide
+```
+
+Confirm that the live frontend LoadBalancer is serving the colour recorded in `active-color`, and that those pods use the same SHA that passed staging.
+
+---
+
+# 18. Monitoring
+
+Staging deploy installs kube-prometheus-stack and ServiceMonitors.
+
+Production deploy applies `kubernetes/monitoring/production-servicemonitors.yaml`.
+
+Check the monitoring namespace:
+
+```bash
+kubectl get pods -n monitoring
+kubectl get svc -n monitoring
+```
+
+Grafana and Prometheus Services are in the `monitoring` namespace. Use those Services to confirm scrape targets for staging and production.
+
+Azure Log Analytics is created by Terraform as `${AKS_CLUSTER_NAME}-logs`. Production soak queries `ContainerLogV2` in that workspace. If the workspace cannot be queried, the Log Analytics check is skipped (fail-open) and soak still uses `/health`.
+
+---
+
+# 19. Discord
+
+Create a Discord incoming webhook and store it as the repository secret `DISCORD_WEBHOOK_URL`.
+
+Production sends a Discord embed for:
+
+* a successful blue/green switch and soak;
+* an automatic rollback (health soak or Log Analytics);
+* a hard workflow failure.
+
+Destroy infra also sends a Discord embed when Terraform destroy finishes or fails.
+
+---
+
+# 20. Verify the 10.3HD path
+
+After a push to `main`, confirm this order succeeds:
+
+```text
+01 - CI
+02 - Deploy to Staging
+03 - Test Staging
+04 - Deploy to Production
+```
+
+Then:
+
+* open the staging frontend IP and confirm the app works;
+* open the production frontend IP and confirm the app works;
+* confirm production pods use the same SHA as staging;
+* confirm Discord received the production result;
+* optionally run `04 - Deploy to Production` by hand with one simulate flag to show gate failure or rollback.
+
+To tear everything down after the demo, run `05 - Destroy infra` and type `destroy`.
