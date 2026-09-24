@@ -96,7 +96,10 @@ jobs:
 
       - name: Ensure active-color ConfigMap exists
         run: |
-          kubectl apply -f kubernetes/production/00-active-color.yaml
+          if ! kubectl get configmap active-color \
+            -n "${{ env.NAMESPACE }}" >/dev/null 2>&1; then
+            kubectl apply -f kubernetes/production/00-active-color.yaml
+          fi
 
       - name: Read active color and compute target
         id: colors
@@ -191,8 +194,10 @@ jobs:
 
       - name: Apply Kubernetes manifests
         run: |
-          kubectl apply \
-            -f kubernetes/production/
+          for f in kubernetes/production/*.yaml; do
+            [ "$(basename "${f}")" = "00-active-color.yaml" ] && continue
+            kubectl apply -f "${f}"
+          done
 
       - name: Remove legacy single-color Deployments
         run: |
