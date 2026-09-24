@@ -1,0 +1,86 @@
+name: 05 - Destroy infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type destroy to confirm
+        required: true
+        type: string
+
+env:
+  AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+  TFSTATE_RG: ${{ vars.TFSTATE_RG }}
+  TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+  TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+
+jobs:
+  destroy:
+    name: Destroy Terraform then tfstate RG
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Confirm destroy
+        run: |
+          if [ "${{ inputs.confirm }}" != "destroy" ]; then
+            echo "Confirmation failed. Type destroy to run this workflow."
+            exit 1
+          fi
+          echo "Confirmation accepted."
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get Terraform state storage access key
+        id: tfstate-key
+        run: |
+          set -euo pipefail
+          ACCESS_KEY="$(az storage account keys list \
+            --resource-group "${TFSTATE_RG}" \
+            --account-name "${TFSTATE_STORAGE_ACCOUNT}" \
+            --query "[0].value" -o tsv)"
+          echo "::add-mask::${ACCESS_KEY}"
+          {
+            echo "access_key<<EOF"
+            echo "${ACCESS_KEY}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform destroy
+        working-directory: terraform
+        env:
+          TFSTATE_ACCESS_KEY: ${{ steps.tfstate-key.outputs.access_key }}
+        run: |
+          set -euo pipefail
+          export ARM_CLIENT_ID="$(jq -r '.clientId' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_CLIENT_SECRET="$(jq -r '.clientSecret' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_SUBSCRIPTION_ID="$(jq -r '.subscriptionId' <<< "${AZURE_CREDENTIALS}")"
+          export ARM_TENANT_ID="$(jq -r '.tenantId' <<< "${AZURE_CREDENTIALS}")"
+          echo "Loading Terraform state from Azure storage."
+          terraform init \
+            -backend-config="resource_group_name=${TFSTATE_RG}" \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="access_key=${TFSTATE_ACCESS_KEY}"
+          echo "Destroying Terraform-managed resources."
+          terraform destroy -auto-approve
+          echo "Terraform destroy finished."
+
+      - name: Delete Terraform state resource group
+        run: |
+          set -euo pipefail
+          echo "Deleting the Terraform state resource group ${TFSTATE_RG}."
+          az group delete --name "${TFSTATE_RG}" --yes --no-wait
+          echo "State resource group delete started."
