@@ -353,13 +353,21 @@ jobs:
                 -n "${{ env.NAMESPACE }}"
             done
 
-            # Rolling update keeps old Ready pods until new ones pass /health.
-            # Delete them so preview Services only see the unhealthy revision.
             for svc in ${BACKENDS}; do
-              kubectl delete pod \
-                -n "${{ env.NAMESPACE }}" \
+              kubectl scale deployment/"${svc}-${TARGET}" \
+                --replicas=0 \
+                -n "${{ env.NAMESPACE }}"
+            done
+            for svc in ${BACKENDS}; do
+              kubectl wait --for=delete pod \
                 -l "app=${svc},version=${TARGET}" \
-                --wait=false
+                -n "${{ env.NAMESPACE }}" \
+                --timeout=90s || true
+            done
+            for svc in ${BACKENDS}; do
+              kubectl scale deployment/"${svc}-${TARGET}" \
+                --replicas=1 \
+                -n "${{ env.NAMESPACE }}"
             done
             sleep 15
           else
@@ -572,10 +580,20 @@ jobs:
           done
 
           for svc in ${BACKENDS}; do
-            kubectl delete pod \
-              -n "${{ env.NAMESPACE }}" \
+            kubectl scale deployment/"${svc}-${LIVE}" \
+              --replicas=0 \
+              -n "${{ env.NAMESPACE }}"
+          done
+          for svc in ${BACKENDS}; do
+            kubectl wait --for=delete pod \
               -l "app=${svc},version=${LIVE}" \
-              --wait=false
+              -n "${{ env.NAMESPACE }}" \
+              --timeout=90s || true
+          done
+          for svc in ${BACKENDS}; do
+            kubectl scale deployment/"${svc}-${LIVE}" \
+              --replicas=1 \
+              -n "${{ env.NAMESPACE }}"
           done
 
           sleep 20
