@@ -13,6 +13,7 @@ env:
   TFSTATE_RG: ${{ vars.TFSTATE_RG }}
   TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
   TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 jobs:
   destroy:
@@ -84,3 +85,53 @@ jobs:
           echo "Deleting the Terraform state resource group ${TFSTATE_RG}."
           az group delete --name "${TFSTATE_RG}" --yes --no-wait
           echo "State resource group delete started."
+
+  notify:
+    name: Discord notification
+    runs-on: ubuntu-latest
+    needs: destroy
+    if: always()
+
+    steps:
+      - name: Discord alert
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DESTROY_RESULT: ${{ needs.destroy.result }}
+        run: |
+          set -euo pipefail
+
+          if [ "${DESTROY_RESULT}" = "success" ]; then
+            TITLE="Infrastructure destroyed"
+            STATUS_TEXT="Terraform destroy completed and the state resource group delete was started."
+            COLOR=3066993
+          else
+            TITLE="Infrastructure destroy failed"
+            STATUS_TEXT="Destroy did not finish. Check the workflow logs. The state resource group may still exist."
+            COLOR=15158332
+          fi
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "embeds": [{
+              "title": "${TITLE}",
+              "color": ${COLOR},
+              "fields": [
+                {"name": "Status", "value": "${STATUS_TEXT}", "inline": false},
+                {"name": "Scenario", "value": "manual terraform destroy", "inline": true},
+                {"name": "State resource group", "value": "${TFSTATE_RG}", "inline": true},
+                {"name": "Run", "value": "[Open workflow](${RUN_URL})", "inline": false}
+              ]
+            }]
+          }
+          EOF
+          )
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}" \
+            "${DISCORD_WEBHOOK_URL}")
+
+          if [ "${HTTP_CODE}" != "204" ]; then
+            echo "Warning: Discord webhook returned HTTP ${HTTP_CODE} (expected 204)"
+          fi
