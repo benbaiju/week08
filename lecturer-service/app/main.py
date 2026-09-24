@@ -112,3 +112,23 @@ def health_check():
         "status": "healthy",
         "service": "lecturer-service",
     }
+
+
+@app.get("/demo/error", tags=["Health"])
+def demo_error():
+    if os.getenv("ENABLE_DEMO_ERRORS") != "true":
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Not Found"},
+        )
+
+    logger.error(
+        "demo /demo/error — returning HTTP 500 while /health stays 200"
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "service": "lecturer-service",
+        },
+    )
