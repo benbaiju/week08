@@ -192,11 +192,61 @@ jobs:
             --dry-run=client \
             -o yaml | kubectl apply -f -
 
+      - name: Snapshot active-color images
+        env:
+          ACTIVE: ${{ needs.determine-colors.outputs.active_color }}
+        run: |
+          set -euo pipefail
+          SERVICES="frontend user-service student-service lecturer-service course-service enrollment-service"
+          : > /tmp/active-images.env
+
+          for svc in ${SERVICES}; do
+            img=$(kubectl get deployment "${svc}-${ACTIVE}" \
+              -n "${{ env.NAMESPACE }}" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+            echo "${svc}|${img}" >> /tmp/active-images.env
+            echo "Snapshot ${svc}-${ACTIVE} image=${img:-<none>}"
+          done
+
       - name: Apply Kubernetes manifests
         run: |
           for f in kubernetes/production/*.yaml; do
             [ "$(basename "${f}")" = "00-active-color.yaml" ] && continue
             kubectl apply -f "${f}"
+          done
+
+      - name: Restore active-color images and clear leftover sim env
+        env:
+          ACTIVE: ${{ needs.determine-colors.outputs.active_color }}
+        run: |
+          set -euo pipefail
+          BACKENDS="user-service student-service lecturer-service course-service enrollment-service"
+
+          while IFS='|' read -r svc img; do
+            if [ -n "${img}" ] && [ "${img}" != "placeholder" ]; then
+              kubectl set image deployment/"${svc}-${ACTIVE}" \
+                "${svc}=${img}" \
+                -n "${{ env.NAMESPACE }}"
+              echo "Restored ${svc}-${ACTIVE} -> ${img}"
+            fi
+          done < /tmp/active-images.env
+
+          for svc in ${BACKENDS}; do
+            if kubectl get deployment "${svc}-${ACTIVE}" -n "${{ env.NAMESPACE }}" >/dev/null 2>&1; then
+              kubectl set env deployment/"${svc}-${ACTIVE}" \
+                FORCE_UNHEALTHY- \
+                ENABLE_DEMO_ERRORS- \
+                -n "${{ env.NAMESPACE }}"
+            fi
+          done
+
+          SERVICES="frontend user-service student-service lecturer-service course-service enrollment-service"
+          for svc in ${SERVICES}; do
+            if kubectl get deployment "${svc}-${ACTIVE}" -n "${{ env.NAMESPACE }}" >/dev/null 2>&1; then
+              kubectl rollout status deployment/"${svc}-${ACTIVE}" \
+                -n "${{ env.NAMESPACE }}" \
+                --timeout=180s || true
+            fi
           done
 
       - name: Remove legacy single-color Deployments
@@ -287,6 +337,7 @@ jobs:
         env:
           TARGET: ${{ needs.determine-colors.outputs.target_color }}
         run: |
+          set -euo pipefail
           BACKENDS="user-service student-service lecturer-service course-service enrollment-service"
 
           for svc in ${BACKENDS}; do
@@ -301,6 +352,16 @@ jobs:
                 FORCE_UNHEALTHY=true \
                 -n "${{ env.NAMESPACE }}"
             done
+
+            # Rolling update keeps old Ready pods until new ones pass /health.
+            # Delete them so preview Services only see the unhealthy revision.
+            for svc in ${BACKENDS}; do
+              kubectl delete pod \
+                -n "${{ env.NAMESPACE }}" \
+                -l "app=${svc},version=${TARGET}" \
+                --wait=false
+            done
+            sleep 15
           else
             for svc in ${BACKENDS}; do
               kubectl set env deployment/"${svc}-${TARGET}" \
@@ -313,6 +374,16 @@ jobs:
         env:
           TARGET: ${{ needs.determine-colors.outputs.target_color }}
         run: |
+          set -euo pipefail
+
+          if [ "${{ env.SIMULATE_SMOKE_FAILURE }}" = "true" ]; then
+            kubectl rollout status deployment/frontend-"${TARGET}" \
+              -n "${{ env.NAMESPACE }}" \
+              --timeout=180s
+            echo "Skipping backend rollout wait — FORCE_UNHEALTHY pods are not expected to become Ready"
+            exit 0
+          fi
+
           DEPLOYMENTS="frontend user-service student-service lecturer-service course-service enrollment-service"
           FAILED=0
 
@@ -326,9 +397,7 @@ jobs:
           done
 
           if [ "${FAILED}" -ne 0 ]; then
-            if [ "${{ env.SIMULATE_SMOKE_FAILURE }}" != "true" ]; then
-              exit 1
-            fi
+            exit 1
           fi
 
       - name: Show production resources
@@ -502,7 +571,14 @@ jobs:
               -n "${{ env.NAMESPACE }}"
           done
 
-          sleep 45
+          for svc in ${BACKENDS}; do
+            kubectl delete pod \
+              -n "${{ env.NAMESPACE }}" \
+              -l "app=${svc},version=${LIVE}" \
+              --wait=false
+          done
+
+          sleep 20
 
           kubectl delete pod post-switch-curl \
             -n "${{ env.NAMESPACE }}" \
@@ -684,11 +760,15 @@ jobs:
               echo "::warning::Log Analytics check unavailable"
             else
               QUERY=$(cat <<EOF
-          ContainerLogV2
+          ContainerLog
           | where TimeGenerated > datetime(${SWITCH_TIME})
-          | where PodNamespace == "production"
-          | where PodName matches regex @"-${LIVE}-"
-          | summarize Total=count(), FailureCount=countif(LogMessage matches regex @"HTTP/[0-9.]+""\s+5[0-9]{2}\b| - ERROR - | - CRITICAL - "), Latest=max(TimeGenerated)
+          | join kind=inner (
+              KubePodInventory
+              | where Namespace == "production"
+              | where Name matches regex @"-${LIVE}-"
+              | distinct ContainerID, Name, Namespace
+          ) on ContainerID
+          | summarize Total=count(), FailureCount=countif(LogEntry matches regex @"HTTP/[0-9.]+""\s+5[0-9]{2}\b| - ERROR - | - CRITICAL - |demo /demo/error"), Latest=max(TimeGenerated)
           EOF
               )
 

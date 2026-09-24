@@ -93,7 +93,7 @@ const Login = () => {
             variant="h4"
             gutterBottom
           >
-            KoalaTech University 10.2D
+            KoalaTech University 10.3HD
           </Typography>
 
           <Typography
